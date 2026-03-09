@@ -1,0 +1,40 @@
+[Unit]
+Description=Runway Webhook Listener
+Documentation=https://https://github.com/Reeteshrajesh/runway
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+
+# Binary location
+ExecStart=/usr/local/bin/runway listen --port 9000 --secret ${GITOPS_WEBHOOK_SECRET}
+
+# Environment — set these in /etc/runway/env or EnvironmentFile
+# GITOPS_REPO       = git remote URL
+# GITOPS_DIR        = working directory (default: /opt/runway)
+# GITOPS_GIT_TOKEN  = optional HTTPS auth token
+# GITOPS_WEBHOOK_SECRET = HMAC signing secret
+EnvironmentFile=-/etc/runway/env
+
+# Restart on failure — do not restart on clean exit (code 0)
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits — keeps the listener minimal
+MemoryMax=64M
+CPUQuota=20%
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/runway /tmp
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=runway
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Binary
+runway
+runway.exe
+
+# Build artifacts
+dist/
+
+# Local secrets — never commit these
+.env
+*.env
+
+# Deploy logs
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+diagram.md
+plan.md
