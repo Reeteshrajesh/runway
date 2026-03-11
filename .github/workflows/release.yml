@@ -3,104 +3,128 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*.*.*"
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Build binaries
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - goos: linux
             goarch: amd64
+            suffix: linux-amd64
           - goos: linux
             goarch: arm64
+            suffix: linux-arm64
           - goos: darwin
             goarch: amd64
+            suffix: darwin-amd64
           - goos: darwin
             goarch: arm64
+            suffix: darwin-arm64
           - goos: windows
             goarch: amd64
+            suffix: windows-amd64.exe
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # needed for git describe in version string
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: "1.22"
           cache: true
 
-      - name: Build binary
+      - name: Build runway-${{ matrix.suffix }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: '0'
+          CGO_ENABLED: "0"
         run: |
-          mkdir -p dist
-          EXT=""
-          [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
-          BINARY="dist/runway-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
+          VERSION="${{ github.ref_name }}"
           go build \
-            -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
-            -o "${BINARY}" \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o dist/runway-${{ matrix.suffix }} \
             ./cmd/runway
-          echo "built: ${BINARY}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: runway-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/
+          name: runway-${{ matrix.suffix }}
+          path: dist/runway-${{ matrix.suffix }}
           retention-days: 1
 
   release:
-    name: Publish GitHub Release
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
           merge-multiple: true
 
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS
-          echo "--- checksums ---"
-          cat SHA256SUMS
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: sha256sum runway-* > SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+          name: runway ${{ github.ref_name }}
+          body: |
+            ## runway ${{ github.ref_name }}
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
+            ### Install
 
-    steps:
-      - uses: actions/checkout@v4
+            **Linux (amd64)**
+            ```bash
+            curl -sSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/runway-linux-amd64 \
+              -o /usr/local/bin/runway && chmod +x /usr/local/bin/runway
+            ```
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache: true
+            **Linux (arm64)**
+            ```bash
+            curl -sSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/runway-linux-arm64 \
+              -o /usr/local/bin/runway && chmod +x /usr/local/bin/runway
+            ```
 
-      - name: Vet
-        run: go vet ./...
+            **macOS**
+            ```bash
+            curl -sSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/runway-darwin-arm64 \
+              -o /usr/local/bin/runway && chmod +x /usr/local/bin/runway
+            ```
 
-      - name: Test
-        run: go test -race -count=1 ./...
+            **go install**
+            ```bash
+            go install github.com/${{ github.repository }}/cmd/runway@${{ github.ref_name }}
+            ```
+
+            See CHANGELOG.md for what changed in this release.
+
+            ### Verify checksums
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
+          files: |
+            dist/runway-linux-amd64
+            dist/runway-linux-arm64
+            dist/runway-darwin-amd64
+            dist/runway-darwin-arm64
+            dist/runway-windows-amd64.exe
+            dist/SHA256SUMS
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

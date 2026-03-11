@@ -12,9 +12,15 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"os"
+	"path/filepath"
+
 	"github.com/Reeteshrajesh/runway/internal/engine"
+	"github.com/Reeteshrajesh/runway/internal/logger"
+	"github.com/Reeteshrajesh/runway/internal/multiapp"
 )
 
 const (
@@ -35,21 +41,49 @@ type Config struct {
 
 	// DeployConfig is the base engine config (Commit will be filled per-request).
 	DeployConfig engine.Config
+
+	// EventLog emits structured deploy lifecycle events (text or JSON).
+	// If nil, a default text logger writing to stderr is used.
+	EventLog *logger.EventLogger
+
+	// RateLimit is the maximum number of webhook requests allowed per minute.
+	// Requests exceeding this limit receive HTTP 429 with a Retry-After header.
+	// Zero or negative values disable rate limiting (no limit).
+	RateLimit int
 }
 
 // Server is a lightweight HTTP server for receiving Git webhooks.
 type Server struct {
-	cfg    Config
-	mux    *http.ServeMux
-	server *http.Server
+	cfg      Config
+	mux      *http.ServeMux
+	server   *http.Server
+	deploys  sync.WaitGroup // tracks in-flight deploy goroutines
+	eventLog *logger.EventLogger
+	limiter  *tokenBucket // nil when rate limiting is disabled
 }
 
 // New creates a new webhook Server with the given configuration.
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg}
+	el := cfg.EventLog
+	if el == nil {
+		el = logger.DefaultEventLogger()
+	}
+
+	var limiter *tokenBucket
+	if cfg.RateLimit > 0 {
+		limiter = newTokenBucket(cfg.RateLimit)
+	}
+
+	s := &Server{cfg: cfg, eventLog: el, limiter: limiter}
 
 	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("/webhook", s.handleWebhook)
+
+	// The /webhook handler is wrapped with rate limiting when configured.
+	var webhookHandler http.Handler = http.HandlerFunc(s.handleWebhook)
+	if limiter != nil {
+		webhookHandler = rateLimitMiddleware(webhookHandler, limiter)
+	}
+	s.mux.Handle("/webhook", webhookHandler)
 	s.mux.HandleFunc("/health", s.handleHealth)
 
 	s.server = &http.Server{
@@ -75,9 +109,15 @@ func (s *Server) Start() error {
 	return s.server.ListenAndServe()
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the HTTP listener and waits for any in-flight
+// deploy goroutine to complete before returning. The context controls how long
+// to wait for the HTTP server itself to drain open connections; deploy
+// goroutines are always awaited (they carry their own deploy timeout).
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.server.Shutdown(ctx)
+	err := s.server.Shutdown(ctx)
+	// Always wait for in-flight deploys regardless of HTTP drain errors.
+	s.deploys.Wait()
+	return err
 }
 
 // handleWebhook processes incoming GitHub push webhook requests.
@@ -115,7 +155,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ── Parse payload to extract commit SHA ───────────────────────────────────
+	// ── Parse payload to extract commit SHA and branch ──────────────────────
 	commit, err := extractCommit(body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("payload parse error: %v", err), http.StatusBadRequest)
@@ -127,19 +167,74 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	branch := extractBranch(body)
+
+	// ── Multi-app fan-out or single-app deploy ───────────────────────────────
+	// If runway.yml exists in the base directory, fan out to all matching apps.
+	// Otherwise fall back to the single-app config.
+	baseDir := s.cfg.DeployConfig.BaseDir
+	if baseDir == "" {
+		baseDir = "/opt/runway"
+	}
+	multiCfg, multiErr := multiapp.ParseFile(filepath.Join(baseDir, "runway.yml"))
+	if multiErr == nil && len(multiCfg.Apps) > 0 {
+		// Multi-app mode: trigger a deploy for each app that allows this branch.
+		for _, app := range multiCfg.Apps {
+			if !app.BranchAllowed(branch) {
+				fmt.Fprintf(os.Stderr, "[runway] multi-app: skipping %s (branch %q not allowed)\n", app.Name, branch)
+				continue
+			}
+			appCfg := engine.Config{
+				BaseDir:   app.BaseDir,
+				RepoURL:   app.Repo,
+				Commit:    commit,
+				Branch:    branch,
+				GitToken:  os.Getenv("GITOPS_GIT_TOKEN"),
+				Triggered: "webhook",
+			}
+			s.deploys.Add(1)
+			go func(cfg engine.Config, name string) {
+				defer s.deploys.Done()
+				s.eventLog.DeployStart(commit, "webhook")
+				result := engine.Deploy(cfg)
+				dur := result.EndedAt.Sub(result.StartedAt).Seconds()
+				if result.Err != nil {
+					if result.AutoRolledBack {
+						s.eventLog.DeployRolledBack(commit, result.RolledBackTo, "webhook", dur)
+					} else {
+						s.eventLog.DeployFailed(commit, "webhook", dur, result.Err)
+					}
+				} else {
+					s.eventLog.DeploySuccess(commit, "webhook", dur)
+				}
+			}(appCfg, app.Name)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = fmt.Fprintf(w, "deployment queued for commit %s (%d apps)\n", commit, len(multiCfg.Apps))
+		return
+	}
+
+	// Single-app mode (no runway.yml or parse error).
 	// ── Trigger deployment (non-blocking) ─────────────────────────────────────
-	// Run in a goroutine so the webhook handler returns immediately (GitHub
-	// expects a response within 10 seconds or it retries).
 	cfg := s.cfg.DeployConfig
 	cfg.Commit = commit
+	cfg.Branch = branch
 	cfg.Triggered = "webhook"
 
+	s.deploys.Add(1)
 	go func() {
+		defer s.deploys.Done()
+		s.eventLog.DeployStart(commit, "webhook")
 		result := engine.Deploy(cfg)
+		dur := result.EndedAt.Sub(result.StartedAt).Seconds()
 		if result.Err != nil {
-			fmt.Printf("deploy failed [%s]: %v\n", commit, result.Err)
+			if result.AutoRolledBack {
+				s.eventLog.DeployRolledBack(commit, result.RolledBackTo, "webhook", dur)
+			} else {
+				s.eventLog.DeployFailed(commit, "webhook", dur, result.Err)
+			}
 		} else {
-			fmt.Printf("deploy succeeded [%s]\n", commit)
+			s.eventLog.DeploySuccess(commit, "webhook", dur)
 		}
 	}()
 
@@ -176,7 +271,8 @@ func verifySignature(body []byte, secret, header string) bool {
 
 // pushPayload represents the minimal fields we need from a GitHub push event.
 type pushPayload struct {
-	After  string `json:"after"`  // commit SHA after the push
+	Ref        string `json:"ref"`   // e.g. "refs/heads/main"
+	After      string `json:"after"` // commit SHA after the push
 	HeadCommit *struct {
 		ID string `json:"id"`
 	} `json:"head_commit"`
@@ -199,4 +295,18 @@ func extractCommit(body []byte) (string, error) {
 	}
 
 	return "", nil
+}
+
+// extractBranch parses the webhook payload and returns the short branch name.
+// e.g. "refs/heads/main" → "main". Returns "" if the ref is not a branch.
+func extractBranch(body []byte) string {
+	var payload pushPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	const prefix = "refs/heads/"
+	if strings.HasPrefix(payload.Ref, prefix) {
+		return strings.TrimPrefix(payload.Ref, prefix)
+	}
+	return ""
 }

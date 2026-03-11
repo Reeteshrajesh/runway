@@ -1,6 +1,8 @@
 package release_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -196,5 +198,96 @@ func TestHistory_AtomicWrite_FileIsValid(t *testing.T) {
 		if _, err := h.Load(); err != nil {
 			t.Fatalf("Load after write %d: %v", i, err)
 		}
+	}
+}
+
+// TestHistory_BackupCreatedOnSave verifies that Append writes history.json.bak
+// alongside history.json so a recovery copy always exists after the first save.
+func TestHistory_BackupCreatedOnSave(t *testing.T) {
+	dir := t.TempDir()
+	h := release.NewHistory(dir)
+
+	if err := h.Append(release.Deployment{
+		Commit: "abc123", Time: time.Now().UTC(), Status: release.StatusRunning,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// After the second save the backup must exist (first save has nothing to back up).
+	if err := h.Append(release.Deployment{
+		Commit: "def456", Time: time.Now().UTC(), Status: release.StatusSuccess,
+	}); err != nil {
+		t.Fatalf("Append 2: %v", err)
+	}
+
+	bakPath := filepath.Join(dir, "history.json.bak")
+	if _, err := os.Stat(bakPath); err != nil {
+		t.Errorf("expected history.json.bak to exist after second save, got: %v", err)
+	}
+}
+
+// TestHistory_RecoveryFromBackup verifies that Load falls back to history.json.bak
+// when history.json is corrupt, and restores it as the live file.
+func TestHistory_RecoveryFromBackup(t *testing.T) {
+	dir := t.TempDir()
+	h := release.NewHistory(dir)
+
+	// First save — no backup yet (nothing to back up on initial write).
+	if err := h.Append(release.Deployment{
+		Commit: "good-commit", Time: time.Now().UTC(), Status: release.StatusRunning,
+	}); err != nil {
+		t.Fatalf("Append 1: %v", err)
+	}
+
+	// Second save — this writes history.json.bak containing the first save's data.
+	if err := h.Append(release.Deployment{
+		Commit: "good-commit", Time: time.Now().UTC(), Status: release.StatusSuccess,
+	}); err != nil {
+		t.Fatalf("Append 2: %v", err)
+	}
+
+	// Now corrupt the live file — the backup still holds good data.
+	histPath := filepath.Join(dir, "history.json")
+	if err := os.WriteFile(histPath, []byte("{broken json"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Load should recover from the backup without returning an error.
+	hist, err := h.Load()
+	if err != nil {
+		t.Fatalf("Load after corruption: %v", err)
+	}
+	if hist.Current != "good-commit" {
+		t.Errorf("Current = %q after recovery, want %q", hist.Current, "good-commit")
+	}
+
+	// The live file should now be valid JSON again (restored from backup).
+	if _, err := h.Load(); err != nil {
+		t.Errorf("second Load after recovery: %v", err)
+	}
+}
+
+// TestHistory_EmptyHistoryWhenBothCorrupt verifies that Load returns an empty
+// history (rather than an error) when both history.json and the backup are corrupt.
+func TestHistory_EmptyHistoryWhenBothCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	h := release.NewHistory(dir)
+
+	histPath := filepath.Join(dir, "history.json")
+	bakPath := filepath.Join(dir, "history.json.bak")
+
+	if err := os.WriteFile(histPath, []byte("not json"), 0644); err != nil {
+		t.Fatalf("WriteFile hist: %v", err)
+	}
+	if err := os.WriteFile(bakPath, []byte("also not json"), 0644); err != nil {
+		t.Fatalf("WriteFile bak: %v", err)
+	}
+
+	hist, err := h.Load()
+	if err != nil {
+		t.Fatalf("Load should not error when both files are corrupt, got: %v", err)
+	}
+	if len(hist.Deployments) != 0 {
+		t.Errorf("expected empty deployments, got %d", len(hist.Deployments))
 	}
 }

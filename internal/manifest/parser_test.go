@@ -233,3 +233,167 @@ func TestValidate_Valid(t *testing.T) {
 		t.Errorf("unexpected validation error: %v", err)
 	}
 }
+
+func TestParse_NotifyEmailBlock(t *testing.T) {
+	content := `app: myapp
+start:
+  - systemctl restart myapp
+notify:
+  email:
+    to: team@company.com
+    from: runway@server.com
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+`
+	path := writeManifest(t, content)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if m.Notify.To != "team@company.com" {
+		t.Errorf("Notify.To = %q, want %q", m.Notify.To, "team@company.com")
+	}
+	if m.Notify.From != "runway@server.com" {
+		t.Errorf("Notify.From = %q, want %q", m.Notify.From, "runway@server.com")
+	}
+	if m.Notify.SMTPHost != "smtp.gmail.com" {
+		t.Errorf("Notify.SMTPHost = %q, want %q", m.Notify.SMTPHost, "smtp.gmail.com")
+	}
+	if m.Notify.SMTPPort != "587" {
+		t.Errorf("Notify.SMTPPort = %q, want %q", m.Notify.SMTPPort, "587")
+	}
+}
+
+func TestParse_NotifyMissing_NoError(t *testing.T) {
+	content := `app: myapp
+start:
+  - systemctl restart myapp
+`
+	path := writeManifest(t, content)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if m.Notify.To != "" || m.Notify.SMTPHost != "" {
+		t.Errorf("expected empty Notify when not configured, got %+v", m.Notify)
+	}
+}
+
+func TestParse_PreDeployHooks(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - systemctl restart my-service
+pre_deploy:
+  - ./scripts/pre-check.sh
+  - echo pre-deploy running
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(m.PreDeploy) != 2 {
+		t.Fatalf("expected 2 pre_deploy commands, got %d", len(m.PreDeploy))
+	}
+	if m.PreDeploy[0] != "./scripts/pre-check.sh" {
+		t.Errorf("PreDeploy[0] = %q, want %q", m.PreDeploy[0], "./scripts/pre-check.sh")
+	}
+	if m.PreDeploy[1] != "echo pre-deploy running" {
+		t.Errorf("PreDeploy[1] = %q, want %q", m.PreDeploy[1], "echo pre-deploy running")
+	}
+}
+
+func TestParse_PostDeployHooks(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - systemctl restart my-service
+post_deploy:
+  - curl -s http://localhost:8080/health
+  - ./scripts/notify-slack.sh
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(m.PostDeploy) != 2 {
+		t.Fatalf("expected 2 post_deploy commands, got %d", len(m.PostDeploy))
+	}
+	if m.PostDeploy[0] != "curl -s http://localhost:8080/health" {
+		t.Errorf("PostDeploy[0] = %q", m.PostDeploy[0])
+	}
+}
+
+func TestParse_BothHooks(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - ./start.sh
+pre_deploy:
+  - ./pre.sh
+post_deploy:
+  - ./post.sh
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(m.PreDeploy) != 1 || m.PreDeploy[0] != "./pre.sh" {
+		t.Errorf("unexpected PreDeploy: %v", m.PreDeploy)
+	}
+	if len(m.PostDeploy) != 1 || m.PostDeploy[0] != "./post.sh" {
+		t.Errorf("unexpected PostDeploy: %v", m.PostDeploy)
+	}
+}
+
+func TestParse_NoHooks_FieldsEmpty(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - ./start.sh
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(m.PreDeploy) != 0 {
+		t.Errorf("expected empty PreDeploy, got %v", m.PreDeploy)
+	}
+	if len(m.PostDeploy) != 0 {
+		t.Errorf("expected empty PostDeploy, got %v", m.PostDeploy)
+	}
+}
+
+func TestParse_HealthCheck(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - ./start.sh
+health_check:
+  url: http://localhost:8080/health
+  interval: 3
+  retries: 5
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if m.HealthCheck.URL != "http://localhost:8080/health" {
+		t.Errorf("HealthCheck.URL = %q", m.HealthCheck.URL)
+	}
+	if m.HealthCheck.Interval != 3 {
+		t.Errorf("HealthCheck.Interval = %d, want 3", m.HealthCheck.Interval)
+	}
+	if m.HealthCheck.Retries != 5 {
+		t.Errorf("HealthCheck.Retries = %d, want 5", m.HealthCheck.Retries)
+	}
+}
+
+func TestParse_HealthCheck_Missing_FieldsZero(t *testing.T) {
+	path := writeManifest(t, `app: my-service
+start:
+  - ./start.sh
+`)
+	m, err := manifest.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if m.HealthCheck.URL != "" {
+		t.Errorf("expected empty HealthCheck.URL, got %q", m.HealthCheck.URL)
+	}
+}

@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/Reeteshrajesh/runway/internal/color"
 	"github.com/Reeteshrajesh/runway/internal/engine"
 )
 
@@ -32,13 +34,29 @@ func runRollback(args []string) error {
 		Triggered: "cli",
 	}
 
-	fmt.Printf("rolling back to commit %s ...\n", commit)
+	color.Infof(os.Stdout, "rolling back to %s", color.Bold(shortSHA(commit)))
 	result := engine.Rollback(cfg)
 
 	if !result.Success {
-		return fmt.Errorf("rollback failed: %v", result.Err)
+		color.Errorf(os.Stderr, "rollback failed: %v", result.Err)
+		return exitErr(rollbackExitCode(result), result.Err)
 	}
 
-	fmt.Printf("rolled back to %s in %.1fs\n", commit, result.EndedAt.Sub(result.StartedAt).Seconds())
+	color.Successf(os.Stdout, "rolled back to %s in %.1fs", shortSHA(commit), result.EndedAt.Sub(result.StartedAt).Seconds())
 	return nil
+}
+
+func rollbackExitCode(r engine.DeployResult) int {
+	if r.Err == nil {
+		return ExitOK
+	}
+	msg := r.Err.Error()
+	switch {
+	case strings.Contains(msg, "not found"):
+		return ExitNotFound
+	case strings.Contains(msg, "already in progress"):
+		return ExitLockHeld
+	default:
+		return ExitGeneralError
+	}
 }

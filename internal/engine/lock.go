@@ -25,8 +25,12 @@ type FileLock struct {
 // AcquireLock attempts to obtain a non-blocking exclusive lock on the lock file.
 // Returns ErrLockHeld if another deploy is already running.
 //
-// Uses syscall.Flock (LOCK_EX|LOCK_NB) which the kernel automatically releases
-// if the process crashes, preventing permanent lockout.
+// Uses syscall.Flock (LOCK_EX|LOCK_NB) — the kernel automatically releases
+// the flock if the holder process crashes, so permanent lockout is impossible.
+// The stale-lock check below is therefore a defence-in-depth diagnostic: if
+// flock says the lock is held but kill(pid, 0) returns ESRCH, something very
+// unexpected has happened (e.g. pid wrap-around or a corrupted lock file) and
+// we surface a clear error rather than silently blocking.
 func AcquireLock(path string) (*FileLock, error) {
 	if path == "" {
 		path = defaultLockPath
@@ -41,6 +45,15 @@ func AcquireLock(path string) (*FileLock, error) {
 	if err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
+			// Lock is genuinely held. Read the PID for a better error message.
+			if pid, pidErr := HeldByPID(path); pidErr == nil {
+				if !isProcessAlive(pid) {
+					// Kernel says locked but process is gone — should not happen
+					// with flock, but report clearly instead of blocking forever.
+					return nil, fmt.Errorf("lock: held by stale PID %d (process not found); remove %s manually", pid, path)
+				}
+				return nil, fmt.Errorf("%w (held by PID %d)", ErrLockHeld, pid)
+			}
 			return nil, ErrLockHeld
 		}
 		return nil, fmt.Errorf("lock: flock %s: %w", path, err)
@@ -51,6 +64,14 @@ func AcquireLock(path string) (*FileLock, error) {
 	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 
 	return &FileLock{path: path, file: f}, nil
+}
+
+// isProcessAlive reports whether a process with the given PID is running.
+// Uses kill(pid, 0) — sends no signal but checks process existence.
+// Returns false only when the kernel returns ESRCH (no such process).
+func isProcessAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // Release unlocks and removes the lock file.

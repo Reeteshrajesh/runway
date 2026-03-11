@@ -11,10 +11,26 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/Reeteshrajesh/runway/internal/color"
 )
 
 // Run is the CLI entry point. It receives os.Args[1:] and the build version.
 func Run(args []string, version string) error {
+	// Strip the global --no-color flag before dispatching to sub-commands.
+	noColor := false
+	filtered := args[:0]
+	for _, a := range args {
+		if a == "--no-color" {
+			noColor = true
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
+	color.Init(os.Stdout, noColor)
+
 	if len(args) == 0 {
 		printUsage(os.Stdout)
 		return nil
@@ -36,6 +52,12 @@ func Run(args []string, version string) error {
 		return runListen(rest)
 	case "log":
 		return runLog(rest)
+	case "init":
+		return runInit(rest)
+	case "doctor":
+		return runDoctor(rest)
+	case "history":
+		return runHistory(rest)
 	case "version", "--version", "-v":
 		fmt.Printf("runway %s\n", version)
 		return nil
@@ -94,9 +116,15 @@ Commands:
   rollback <commit>           Roll back to a previously deployed commit
   status                      Show current deployment status
   releases                    List all stored releases
+  history                     Show full deployment history
   listen                      Start the webhook listener (HTTP server)
   log <commit>                Print the deploy log for a commit
+  init                        Interactively create manifest.yml and directory structure
+  doctor                      Check runway setup and diagnose problems
   version                     Print version information
+
+Global flags:
+  --no-color                  Disable colored output
 
 Environment variables:
   GITOPS_DIR          Working directory (default: /opt/runway)

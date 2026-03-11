@@ -2,7 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/Reeteshrajesh/runway/internal/color"
 	"github.com/Reeteshrajesh/runway/internal/release"
 )
 
@@ -30,14 +32,14 @@ func runReleases(args []string) error {
 	}
 
 	fmt.Printf("%-14s  %s\n", "commit", "active")
-	fmt.Println(repeat("─", 22))
+	fmt.Println(strings.Repeat("─", 22))
 
 	// Print newest first.
 	for i := len(releases) - 1; i >= 0; i-- {
 		commit := releases[i]
 		marker := ""
 		if commit == active {
-			marker = "  ← current"
+			marker = "  " + color.Cyan("← current")
 		}
 		fmt.Printf("%-14s%s\n", shortSHA(commit), marker)
 	}

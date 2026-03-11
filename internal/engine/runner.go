@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
@@ -20,15 +21,21 @@ type RunOptions struct {
 }
 
 // RunCommand executes a single shell command string via /bin/sh -c.
-// Returns a non-nil error if the command exits with a non-zero status.
-func RunCommand(cmd string, opts RunOptions) error {
-	c := exec.Command("/bin/sh", "-c", cmd)
+// The context controls the deadline — if it expires the child process is killed.
+// Returns a non-nil error if the command exits with a non-zero status or the
+// context is cancelled/timed out.
+func RunCommand(ctx context.Context, cmd string, opts RunOptions) error {
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.Dir = opts.Dir
 	c.Env = opts.Env
 	c.Stdout = opts.Stdout
 	c.Stderr = opts.Stderr
 
 	if err := c.Run(); err != nil {
+		// Distinguish timeout/cancellation from a plain non-zero exit.
+		if ctx.Err() != nil {
+			return fmt.Errorf("command %q killed: %w", cmd, ctx.Err())
+		}
 		return fmt.Errorf("command %q failed: %w", cmd, err)
 	}
 	return nil
@@ -36,9 +43,9 @@ func RunCommand(cmd string, opts RunOptions) error {
 
 // RunCommands executes a sequence of commands using the same options.
 // Stops immediately on the first failure, returning the error with context.
-func RunCommands(cmds []string, opts RunOptions) error {
+func RunCommands(ctx context.Context, cmds []string, opts RunOptions) error {
 	for i, cmd := range cmds {
-		if err := RunCommand(cmd, opts); err != nil {
+		if err := RunCommand(ctx, cmd, opts); err != nil {
 			return fmt.Errorf("step %d/%d: %w", i+1, len(cmds), err)
 		}
 	}

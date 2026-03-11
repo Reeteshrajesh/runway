@@ -23,7 +23,8 @@ type DeployLogger struct {
 	file   *os.File
 	writer *bufio.Writer
 	// tee mirrors all output to an additional writer (e.g. os.Stdout for CLI feedback).
-	tee io.Writer
+	tee     io.Writer
+	colored bool // true when tee is a TTY and color output is enabled
 }
 
 // New creates a new DeployLogger that writes to <releaseDir>/deploy.log.
@@ -85,4 +86,70 @@ func (l *DeployLogger) Close() error {
 		return fmt.Errorf("logger: flush %s: %w", l.path, err)
 	}
 	return l.file.Close()
+}
+
+// linePrefixWriter wraps an io.Writer and prepends prefix to each line.
+// Partial lines (no trailing newline) are held until the newline arrives.
+type linePrefixWriter struct {
+	w      io.Writer
+	prefix string
+	buf    []byte
+}
+
+func (lp *linePrefixWriter) Write(p []byte) (int, error) {
+	total := len(p)
+	lp.buf = append(lp.buf, p...)
+	for {
+		idx := -1
+		for i, b := range lp.buf {
+			if b == '\n' {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			break
+		}
+		line := lp.buf[:idx+1]
+		_, err := fmt.Fprintf(lp.w, "%s%s", lp.prefix, line)
+		if err != nil {
+			return 0, err
+		}
+		lp.buf = lp.buf[idx+1:]
+	}
+	return total, nil
+}
+
+// NewStreaming creates a DeployLogger whose tee output is prefixed with
+// "[runway] " on each line. The log file receives raw unprefixed output.
+// Use this for CLI-triggered deploys where the operator is watching the terminal.
+func NewStreaming(releaseDir string, prefix string, out io.Writer) (*DeployLogger, error) {
+	tee := &linePrefixWriter{w: out, prefix: prefix}
+	l, err := New(releaseDir, tee)
+	if err != nil {
+		return nil, err
+	}
+	// Enable color if out is a TTY.
+	if f, ok := out.(*os.File); ok {
+		if info, statErr := f.Stat(); statErr == nil {
+			l.colored = (info.Mode() & os.ModeCharDevice) != 0
+		}
+	}
+	return l, nil
+}
+
+// Step prints a step banner directly to the terminal tee writer.
+// When the tee is a TTY, the arrow prefix is rendered in cyan.
+// Step does NOT write to the log file — use Logf for file-level step markers.
+func (l *DeployLogger) Step(format string, args ...any) {
+	if l.tee == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if l.colored {
+		// Cyan arrow + reset
+		_, _ = fmt.Fprintf(l.tee, "\033[36m%s\033[0m\n", msg)
+	} else {
+		_, _ = fmt.Fprintf(l.tee, "%s\n", msg)
+	}
 }

@@ -2,15 +2,18 @@ package engine_test
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Reeteshrajesh/runway/internal/engine"
 )
 
 func TestRunCommand_Success(t *testing.T) {
 	var buf bytes.Buffer
-	err := engine.RunCommand("echo hello", engine.RunOptions{
+	err := engine.RunCommand(context.Background(), "echo hello", engine.RunOptions{
 		Stdout: &buf,
 		Stderr: &buf,
 	})
@@ -23,7 +26,7 @@ func TestRunCommand_Success(t *testing.T) {
 }
 
 func TestRunCommand_Failure(t *testing.T) {
-	err := engine.RunCommand("exit 1", engine.RunOptions{
+	err := engine.RunCommand(context.Background(), "exit 1", engine.RunOptions{
 		Stdout: &bytes.Buffer{},
 		Stderr: &bytes.Buffer{},
 	})
@@ -33,7 +36,7 @@ func TestRunCommand_Failure(t *testing.T) {
 }
 
 func TestRunCommand_NonExistentBinary(t *testing.T) {
-	err := engine.RunCommand("this_binary_does_not_exist_xyz", engine.RunOptions{
+	err := engine.RunCommand(context.Background(), "this_binary_does_not_exist_xyz", engine.RunOptions{
 		Stdout: &bytes.Buffer{},
 		Stderr: &bytes.Buffer{},
 	})
@@ -44,7 +47,7 @@ func TestRunCommand_NonExistentBinary(t *testing.T) {
 
 func TestRunCommand_CapturesStdout(t *testing.T) {
 	var out bytes.Buffer
-	_ = engine.RunCommand("printf 'line1\nline2'", engine.RunOptions{
+	_ = engine.RunCommand(context.Background(), "printf 'line1\nline2'", engine.RunOptions{
 		Stdout: &out,
 		Stderr: &bytes.Buffer{},
 	})
@@ -57,7 +60,7 @@ func TestRunCommand_CapturesStdout(t *testing.T) {
 
 func TestRunCommand_CapturesStderr(t *testing.T) {
 	var stderr bytes.Buffer
-	_ = engine.RunCommand("echo err >&2", engine.RunOptions{
+	_ = engine.RunCommand(context.Background(), "echo err >&2", engine.RunOptions{
 		Stdout: &bytes.Buffer{},
 		Stderr: &stderr,
 	})
@@ -71,7 +74,7 @@ func TestRunCommand_WorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
 	var out bytes.Buffer
 
-	err := engine.RunCommand("pwd", engine.RunOptions{
+	err := engine.RunCommand(context.Background(), "pwd", engine.RunOptions{
 		Dir:    dir,
 		Stdout: &out,
 		Stderr: &bytes.Buffer{},
@@ -89,7 +92,7 @@ func TestRunCommand_WorkingDirectory(t *testing.T) {
 func TestRunCommand_EnvInjection(t *testing.T) {
 	var out bytes.Buffer
 
-	err := engine.RunCommand("echo $MY_TEST_VAR", engine.RunOptions{
+	err := engine.RunCommand(context.Background(), "echo $MY_TEST_VAR", engine.RunOptions{
 		Env:    []string{"MY_TEST_VAR=injected_value"},
 		Stdout: &out,
 		Stderr: &bytes.Buffer{},
@@ -103,11 +106,51 @@ func TestRunCommand_EnvInjection(t *testing.T) {
 	}
 }
 
+// TestRunCommand_ContextCancellation verifies that a running command is killed
+// when its context is cancelled before the command completes.
+func TestRunCommand_ContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel immediately before the command can finish.
+	cancel()
+
+	err := engine.RunCommand(ctx, "sleep 10", engine.RunOptions{
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+	})
+	if err == nil {
+		t.Fatal("expected error when context is cancelled, got nil")
+	}
+	// The error must wrap context.Canceled.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, expected to wrap context.Canceled", err)
+	}
+}
+
+// TestRunCommand_ContextTimeout verifies that a long-running command is killed
+// when the deadline expires.
+func TestRunCommand_ContextTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := engine.RunCommand(ctx, "sleep 10", engine.RunOptions{
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+	})
+	if err == nil {
+		t.Fatal("expected error when context times out, got nil")
+	}
+	// The error must wrap context.DeadlineExceeded.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, expected to wrap context.DeadlineExceeded", err)
+	}
+}
+
 func TestRunCommands_AllSucceed(t *testing.T) {
 	var out bytes.Buffer
 	cmds := []string{"echo one", "echo two", "echo three"}
 
-	err := engine.RunCommands(cmds, engine.RunOptions{
+	err := engine.RunCommands(context.Background(), cmds, engine.RunOptions{
 		Stdout: &out,
 		Stderr: &bytes.Buffer{},
 	})
@@ -127,7 +170,7 @@ func TestRunCommands_StopsOnFirstFailure(t *testing.T) {
 	var out bytes.Buffer
 	cmds := []string{"echo first", "exit 1", "echo third"}
 
-	err := engine.RunCommands(cmds, engine.RunOptions{
+	err := engine.RunCommands(context.Background(), cmds, engine.RunOptions{
 		Stdout: &out,
 		Stderr: &bytes.Buffer{},
 	})
@@ -144,7 +187,7 @@ func TestRunCommands_StopsOnFirstFailure(t *testing.T) {
 func TestRunCommands_ErrorMessageContainsStepInfo(t *testing.T) {
 	cmds := []string{"echo ok", "exit 42", "echo never"}
 
-	err := engine.RunCommands(cmds, engine.RunOptions{
+	err := engine.RunCommands(context.Background(), cmds, engine.RunOptions{
 		Stdout: &bytes.Buffer{},
 		Stderr: &bytes.Buffer{},
 	})
@@ -159,11 +202,42 @@ func TestRunCommands_ErrorMessageContainsStepInfo(t *testing.T) {
 }
 
 func TestRunCommands_EmptyList(t *testing.T) {
-	err := engine.RunCommands(nil, engine.RunOptions{
+	err := engine.RunCommands(context.Background(), nil, engine.RunOptions{
 		Stdout: &bytes.Buffer{},
 		Stderr: &bytes.Buffer{},
 	})
 	if err != nil {
 		t.Errorf("empty command list should succeed, got: %v", err)
+	}
+}
+
+// TestRunCommands_ContextCancelledMidway verifies that RunCommands stops
+// executing further steps when its context is cancelled between steps.
+func TestRunCommands_ContextCancelledMidway(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var out bytes.Buffer
+	// The second command cancels the context; the third must never run.
+	cmds := []string{
+		"echo step1",
+		"sleep 10",
+		"echo step3",
+	}
+
+	// Cancel after a short delay so step1 completes but step2 gets killed.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	err := engine.RunCommands(ctx, cmds, engine.RunOptions{
+		Stdout: &out,
+		Stderr: &bytes.Buffer{},
+	})
+	if err == nil {
+		t.Fatal("expected error when context is cancelled midway, got nil")
+	}
+	if strings.Contains(out.String(), "step3") {
+		t.Error("step3 should not have run after context cancellation")
 	}
 }
